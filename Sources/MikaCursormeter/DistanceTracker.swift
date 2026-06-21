@@ -18,6 +18,13 @@ final class DistanceTracker {
         return f
     }()
 
+    private static let monthFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "de_DE")
+        f.setLocalizedDateFormatFromTemplate("MMM")
+        return f
+    }()
+
     private struct SpeedSample {
         let timestamp: TimeInterval
         let counts: Double
@@ -36,6 +43,16 @@ final class DistanceTracker {
         let totalKm: Double
     }
 
+    enum HistoryRange: Int, CaseIterable {
+        case days, weeks, months, years
+    }
+
+    struct HistoryBucket {
+        let label: String   // z.B. "21", "KW25", "Jun", "2026"
+        let km: Double
+        let isCurrent: Bool // aktueller Tag/Woche/Monat/Jahr → Hervorhebung
+    }
+
     struct Stats {
         let speedKmh: Double
         let tripKm: Double
@@ -44,7 +61,9 @@ final class DistanceTracker {
         let bestDayKm: Double
         let activeDayCount: Int
         let vMax: Double
-        let lastDays: [(label: String, isoDate: String, km: Double, isToday: Bool)]
+        let thisWeekKm: Double
+        let thisMonthKm: Double
+        let thisYearKm: Double
     }
 
     init(store: PersistenceStore) {
@@ -160,21 +179,28 @@ final class DistanceTracker {
         var activeDayCount = history.filter { $0.value > 0 }.count
         if tripKm > 0 && history[todayKey] == nil { activeDayCount += 1 }
 
+        // Summen für aktuelle Woche / Monat / Jahr. tripKm (heutige Fahrt) ist noch
+        // nicht in dailyHistory und wird zu jeder aktuellen Periode addiert.
         let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let weekdayLabels = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"]
-        var days: [(label: String, isoDate: String, km: Double, isToday: Bool)] = []
-        for offset in (0..<14).reversed() {
-            guard let date = calendar.date(byAdding: .day, value: -offset, to: today) else { continue }
-            let key = Self.isoDayFormatter.string(from: date)
-            let km: Double
-            if offset == 0 {
-                km = tripKm + (history[key] ?? 0)
-            } else {
-                km = history[key] ?? 0
+        let nowDate = Date()
+        let entries = Self.datedEntries(from: history)
+        let weekComps = calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: nowDate)
+        let monthComps = calendar.dateComponents([.year, .month], from: nowDate)
+        let currentYear = calendar.component(.year, from: nowDate)
+
+        var thisWeekKm = tripKm
+        var thisMonthKm = tripKm
+        var thisYearKm = tripKm
+        for entry in entries {
+            if calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: entry.date) == weekComps {
+                thisWeekKm += entry.km
             }
-            let weekday = calendar.component(.weekday, from: date)
-            days.append((label: weekdayLabels[weekday - 1], isoDate: key, km: km, isToday: offset == 0))
+            if calendar.dateComponents([.year, .month], from: entry.date) == monthComps {
+                thisMonthKm += entry.km
+            }
+            if calendar.component(.year, from: entry.date) == currentYear {
+                thisYearKm += entry.km
+            }
         }
 
         return Stats(
@@ -185,8 +211,103 @@ final class DistanceTracker {
             bestDayKm: bestDayKm,
             activeDayCount: activeDayCount,
             vMax: vMax,
-            lastDays: days
+            thisWeekKm: thisWeekKm,
+            thisMonthKm: thisMonthKm,
+            thisYearKm: thisYearKm
         )
+    }
+
+    // MARK: - Verlauf (Tage / Wochen / Monate / Jahre)
+
+    /// Aggregierte Verlaufsdaten für den gewählten Zeitraum.
+    func history(for range: HistoryRange) -> [HistoryBucket] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let entries = Self.datedEntries(from: store.dailyHistory)
+        let calendar = Calendar.current
+        let now = Date()
+
+        switch range {
+        case .days:   return dayBuckets(entries: entries, calendar: calendar, now: now, count: 30)
+        case .weeks:  return weekBuckets(entries: entries, calendar: calendar, now: now, count: 12)
+        case .months: return monthBuckets(entries: entries, calendar: calendar, now: now, count: 12)
+        case .years:  return yearBuckets(entries: entries, calendar: calendar, now: now)
+        }
+    }
+
+    /// Wandelt die ISO-Tageskeys der Historie in (Date, km)-Paare zurück.
+    private static func datedEntries(from history: [String: Double]) -> [(date: Date, km: Double)] {
+        history.compactMap { key, km in
+            guard let date = isoDayFormatter.date(from: key) else { return nil }
+            return (date: date, km: km)
+        }
+    }
+
+    // Helfer laufen unter `lock` (lesen tripKm direkt) und nehmen den Lock NICHT erneut.
+
+    private func dayBuckets(entries: [(date: Date, km: Double)], calendar: Calendar, now: Date, count: Int) -> [HistoryBucket] {
+        let today = calendar.startOfDay(for: now)
+        var sums: [Date: Double] = [:]
+        for entry in entries {
+            sums[calendar.startOfDay(for: entry.date), default: 0] += entry.km
+        }
+        var buckets: [HistoryBucket] = []
+        for offset in (0..<count).reversed() {
+            guard let date = calendar.date(byAdding: .day, value: -offset, to: today) else { continue }
+            var km = sums[date] ?? 0
+            if offset == 0 { km += tripKm }
+            buckets.append(HistoryBucket(label: "\(calendar.component(.day, from: date))", km: km, isCurrent: offset == 0))
+        }
+        return buckets
+    }
+
+    private func weekBuckets(entries: [(date: Date, km: Double)], calendar: Calendar, now: Date, count: Int) -> [HistoryBucket] {
+        var sums: [DateComponents: Double] = [:]
+        for entry in entries {
+            sums[calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: entry.date), default: 0] += entry.km
+        }
+        var buckets: [HistoryBucket] = []
+        for offset in (0..<count).reversed() {
+            guard let date = calendar.date(byAdding: .weekOfYear, value: -offset, to: now) else { continue }
+            let comps = calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
+            var km = sums[comps] ?? 0
+            if offset == 0 { km += tripKm }
+            buckets.append(HistoryBucket(label: "KW\(comps.weekOfYear ?? 0)", km: km, isCurrent: offset == 0))
+        }
+        return buckets
+    }
+
+    private func monthBuckets(entries: [(date: Date, km: Double)], calendar: Calendar, now: Date, count: Int) -> [HistoryBucket] {
+        var sums: [DateComponents: Double] = [:]
+        for entry in entries {
+            sums[calendar.dateComponents([.year, .month], from: entry.date), default: 0] += entry.km
+        }
+        var buckets: [HistoryBucket] = []
+        for offset in (0..<count).reversed() {
+            guard let date = calendar.date(byAdding: .month, value: -offset, to: now) else { continue }
+            let comps = calendar.dateComponents([.year, .month], from: date)
+            var km = sums[comps] ?? 0
+            if offset == 0 { km += tripKm }
+            buckets.append(HistoryBucket(label: Self.monthFormatter.string(from: date), km: km, isCurrent: offset == 0))
+        }
+        return buckets
+    }
+
+    private func yearBuckets(entries: [(date: Date, km: Double)], calendar: Calendar, now: Date) -> [HistoryBucket] {
+        var sums: [Int: Double] = [:]
+        for entry in entries {
+            sums[calendar.component(.year, from: entry.date), default: 0] += entry.km
+        }
+        let currentYear = calendar.component(.year, from: now)
+        let earliestYear = min(sums.keys.min() ?? currentYear, currentYear)
+        var buckets: [HistoryBucket] = []
+        for year in earliestYear...currentYear {
+            var km = sums[year] ?? 0
+            if year == currentYear { km += tripKm }
+            buckets.append(HistoryBucket(label: "\(year)", km: km, isCurrent: year == currentYear))
+        }
+        return buckets
     }
 
     func resetPeakSpeed() {
